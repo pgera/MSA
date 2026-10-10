@@ -3,8 +3,9 @@
 
 #pragma once
 
-#include "cute/arch/mma_sm100_umma.hpp"
 #include "cute/tensor.hpp"
+
+#include "cute/arch/mma_sm100_umma.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/float8.h"
 
@@ -21,9 +22,9 @@ inline constexpr int kQHeadsPerKv = 16;
 inline constexpr int kHeadDim = 128;
 inline constexpr int kPageSize = 128;
 inline constexpr int kQueriesPerGroup = 128 / kQHeadsPerKv;
-inline constexpr int kQStages = 3;
+inline constexpr int kQStages = 8;
 inline constexpr int kScoreStages = 2;
-inline constexpr int kQMetadataStages = 16;
+inline constexpr int kQMetadataStages = 32;
 // Block-scale staging: the dequant divides each E4M3 block scale by 2^kBlockScaleShift so that
 // code x scale fits E4M3 for full-range (TransformerEngine-style) scales; the host folds 2^shift
 // back into the softmax and output scales. Each shift is its own extension.
@@ -32,9 +33,9 @@ static_assert(kBlockScaleShift >= 0 && kBlockScaleShift <= 7, "block-scale shift
 
 inline constexpr int kTmemScoreOffset = 0;
 inline constexpr int kTmemScoreStride = 128;
-inline constexpr int kTmemProbabilityOffset = 96;
 inline constexpr int kTmemOutputOffset = 256;
 inline constexpr int kTmemOutputStride = 128;
+inline constexpr int kTmemProbabilityOffset = 96;
 inline constexpr int kTmemColumns = 512;
 
 inline constexpr int kPackedKvBytes = kPageSize * kHeadDim / 2;
@@ -114,7 +115,6 @@ inline constexpr int kOtherRegisters = 64;
 static_assert(kSoftmax0Registers + kSoftmax1Registers + kEpilogueRegisters + kOtherRegisters <=
               512);
 
-inline constexpr int kEpilogueBarrierId = 4;
 inline constexpr int kKvDequantKBarrierId = 6;
 inline constexpr int kKvDequantVBarrierId = 7;
 inline constexpr int kTmemBarrierId = 0;

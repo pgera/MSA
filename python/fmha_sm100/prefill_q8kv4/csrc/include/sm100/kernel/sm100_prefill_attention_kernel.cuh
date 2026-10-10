@@ -32,6 +32,8 @@ void prefill_attention_kernel(
   // producers of Q, the KV cache and the schedule are still running; wait for their writes
   // before the first global read.
   cutlass::arch::wait_on_dependent_grids();
+  if (WarpSpecialization::is_mma_warp(warp_idx)) {
+  }
 
   bool const active =
       static_cast<int>(blockIdx.x) < arguments.work_count_ptr[0];

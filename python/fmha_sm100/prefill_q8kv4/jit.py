@@ -132,7 +132,7 @@ class JitSpec:
     q_heads_per_kv: int = 16
     head_dim: int = 128
     page_size: int = 128
-    q_stages: int = 3
+    q_stages: int = 8
     score_stages: int = 2
 
     @property
