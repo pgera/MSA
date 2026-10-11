@@ -26,7 +26,7 @@ _KV_SCALE_ROW_BYTES = _HEAD_DIM // 16
 def _sparse_stack():
     """Return fmha_sm100's k2q CSR builder and split combine (the CuTe-DSL sparse stack)."""
     from .. import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
-    from src.sm100.fwd.combine import combine
+    from src.blackwell_prefill.combine import combine
 
     return sparse.build_k2q_csr, combine
 
@@ -200,10 +200,6 @@ def run_prefill(
         out = torch.empty((total_q, num_q_heads, _HEAD_DIM), dtype=torch.bfloat16, **options)
 
     _, combine = _sparse_stack()
-    from ..sparse_fmha_adapter import _supports_blackwell_prefill
-
-    if _supports_blackwell_prefill(q.device, topk=topk):
-        from src.blackwell_prefill.combine import combine
     load_extension(q.device, block_scale_shift).run(
         q,
         k_cache,
@@ -231,7 +227,6 @@ def run_prefill(
         lse_partial,
         out,
         lse,
-        cu_seqlens=cu_seqlens_q,
         split_counts=schedule.split_counts,
         use_pdl=True,
     )
