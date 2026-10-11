@@ -12,6 +12,9 @@
 #if !defined(FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT)
 #error "The Q8KV4 prefill JIT must define FMHA_SM100_PREFILL_Q8KV4_BLOCK_SCALE_SHIFT"
 #endif
+#if !defined(FMHA_SM100_PREFILL_Q8KV4_SM107)
+#error "The Q8KV4 prefill JIT must define FMHA_SM100_PREFILL_Q8KV4_SM107"
+#endif
 
 namespace fmha_sm100::prefill_q8kv4::detail {
 

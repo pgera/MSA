@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "sm100/common/sm107_mma_ts.cuh"
 #include "sm100/kernel/sm100_prefill_attention_kernel.cuh"
 
 #include <cstdint>
@@ -11,6 +12,10 @@
 #include <cuda_runtime.h>
 
 #include "cute/tensor.hpp"
+#if FMHA_SM100_PREFILL_Q8KV4_SM107
+#include "cute/arch/mma_sm107_umma.hpp"
+#include "cute/atom/mma_traits_sm107.hpp"
+#endif
 #include "cutlass/gemm/collective/builders/sm100_common.inl"
 #include "cutlass/version.h"
 
@@ -48,7 +53,11 @@ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStre
   using namespace cute;
   using namespace detail;
 
-#if CUTLASS_MAJOR > 4 || (CUTLASS_MAJOR == 4 && CUTLASS_MINOR >= 8)
+#if FMHA_SM100_PREFILL_Q8KV4_SM107
+  // SM107: K = 64 per instruction, twice the SM100 FP8 rate.
+  using QkMmaAtom =
+      SM107_MMA_F8F6F4_SS<Element, Element, Accumulator, 128, 128, UMMA::Major::K, UMMA::Major::K>;
+#elif CUTLASS_MAJOR > 4 || (CUTLASS_MAJOR == 4 && CUTLASS_MINOR >= 8)
   using QkMmaAtom =
       SM100_MMA_F8F6F4_SS<Element, Element, Accumulator, 128, 128, UMMA::Major::K, UMMA::Major::K>;
 #else
@@ -60,9 +69,14 @@ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStre
       integral_constant<UMMA::ScaleIn, UMMA::ScaleIn::One>>>;
 #endif
   using TiledMmaQK = decltype(make_tiled_mma(QkMmaAtom{}));
-  using TiledMmaPV =
-      decltype(make_tiled_mma(SM100_MMA_F8F6F4_TS<Element, Element, Accumulator, 128, 128,
-                                                  UMMA::Major::K, UMMA::Major::MN>{}));
+#if FMHA_SM100_PREFILL_Q8KV4_SM107
+  using PvMmaAtom = detail::Sm107MmaF8F6F4Ts<Element, Element, Accumulator, 128, 128,
+                                             UMMA::Major::K, UMMA::Major::MN>;
+#else
+  using PvMmaAtom = SM100_MMA_F8F6F4_TS<Element, Element, Accumulator, 128, 128, UMMA::Major::K,
+                                        UMMA::Major::MN>;
+#endif
+  using TiledMmaPV = decltype(make_tiled_mma(PvMmaAtom{}));
 
   using QShape = decltype(make_shape(Int<128>{}, Int<128>{}, Int<kQStages>{}));
   using KShape = decltype(make_shape(Int<128>{}, Int<128>{}, _1{}));

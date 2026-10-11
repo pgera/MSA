@@ -188,6 +188,9 @@ class JitSpec:
                 f"-gencode=arch=compute_{self.target_arch},code=sm_{self.target_arch}",
                 shift_define,
                 f"-DFMHA_SM100_PREFILL_Q8KV4_HAS_QMUL4={has_qmul4}",
+                # Seen by the host and device passes alike (the cute arch macros are device-only),
+                # so the kernel instantiation the host registers is the one the cubin holds.
+                f"-DFMHA_SM100_PREFILL_Q8KV4_SM107={int(self.target_arch == '107a')}",
             ],
             "extra_ldflags": ["-lcuda", f"-Wl,-rpath,{_cuda_home() / 'lib64'}"],
         }
