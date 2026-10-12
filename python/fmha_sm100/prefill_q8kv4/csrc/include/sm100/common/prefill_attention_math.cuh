@@ -334,8 +334,9 @@ CUTLASS_DEVICE void store_partial_output_pass(RegTensor const &rOPass,
 template <class TiledMmaPV, class OutputTensor, class CoordinateTensor>
 CUTLASS_DEVICE void
 store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor cO,
-                     cutlass::bfloat16_t *o_partial_ptr, float *lse_partial_ptr, int total_q,
-                     int num_q_heads, float softmax_scale_log2, float output_scale, int head_kv,
+                     cutlass::bfloat16_t *o_partial_ptr, int64_t o_partial_split_stride,
+                     float *lse_partial_ptr, int total_q, int num_q_heads,
+                     float softmax_scale_log2, float output_scale, int head_kv,
                      int q_count, int q_batch_offset, int group, int group_thread,
                      int const *qsplit_indices, float const *row_sum, float const *row_max) {
   int const lane = group_thread & 31;
@@ -369,7 +370,8 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor 
       int const q_abs = q_batch_offset + q_idx;
       int const head = head_kv * kQHeadsPerKv + row % kQHeadsPerKv;
       int64_t const row_offset =
-          ((static_cast<int64_t>(split) * total_q + q_abs) * num_q_heads + head) * kHeadDim;
+          static_cast<int64_t>(split) * o_partial_split_stride +
+          (static_cast<int64_t>(q_abs) * num_q_heads + head) * kHeadDim;
       float const sum = row_sum[row];
       rows[row_index][half].ptr = o_partial_ptr + row_offset;
       rows[row_index][half].scale = sum > 0.0f ? rcp_approx_ftz(sum) * output_scale : 0.0f;

@@ -68,7 +68,7 @@ out, lse = wrapper.run(q, (k_data, v_data), kv_cache_sf=(k_scale, v_scale),
 ```
 
 `plan` builds the k2q CSR and schedule from one layer's TopK lists outside CUDA Graph capture and
-preallocates the split workspace; `run` may be captured and replayed. `run_prefill` runs the
+reserves the split workspace; `run` may be captured and replayed. `run_prefill` runs the
 forward and the combine over a CSR and schedule the caller built with `build_k2q_csr(...,
 return_schedule=True)` (that is what `fmha_sm100` does per layer), so a caller that already
 builds them for the CuTe-DSL kernel swaps only the attention call:
@@ -81,6 +81,29 @@ run_prefill(q_e4m3, (k_data, v_data), (k_sf, v_sf), kv_indices=block_table, kv_i
             schedule=schedule, sm_scale=softmax_scale * q_scale, topk=topk, seqused_k=seq_lens,
             k_global_scale=k_global, v_global_scale=v_global, block_scale_shift=3, out=out)
 ```
+
+### Split workspace
+
+The forward writes one partial output and LSE per (query, head, selected page) and the combine
+merges them. `PrefillWorkspace` owns those buffers: a wrapper creates its own, wrappers that run
+in order on one stream may share one, and `run_prefill` takes one through `workspace=` (without
+it the partials are fresh allocations per call).
+
+```python
+from fmha_sm100.prefill_q8kv4 import PrefillWorkspace
+
+workspace = PrefillWorkspace(device)
+workspace = PrefillWorkspace(device, partial_bytes=workspace.required_bytes(topk, max_total_q, Hq))
+run_prefill(..., workspace=workspace)
+```
+
+On a GPU with several memory locality domains (Rubin, Blackwell) the workspace stripes the
+partial buffer over the domains and the combine reads every tile from the domain of its own SM,
+which raises its bandwidth where the inter-domain fabric is the limit; the kernels and results
+are the same as with interleaved memory. Reserve the largest batch up front with
+`partial_bytes`: a batch that outgrows a striped buffer synchronizes the device before replacing
+it. `FMHA_SM100_PREFILL_Q8KV4_LOCALITY_DOMAINS=0` keeps the buffer interleaved (for
+comparisons). One workspace must not be used from two streams at once.
 
 ## Data contract
 

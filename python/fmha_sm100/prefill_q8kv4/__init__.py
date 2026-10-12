@@ -6,6 +6,7 @@
 from .interface import (
     SUPPORTED_TOPK,
     BatchPrefillWithPagedKVCacheWrapper,
+    PrefillWorkspace,
     interleave_v_scales,
     run_prefill,
 )
@@ -13,6 +14,7 @@ from .interface import (
 __all__ = [
     "SUPPORTED_TOPK",
     "BatchPrefillWithPagedKVCacheWrapper",
+    "PrefillWorkspace",
     "interleave_v_scales",
     "run_prefill",
 ]

@@ -14,9 +14,16 @@ shared-memory slots with one bulk-tensor copy per (tile, split).
 The partial output columns are in the STG.128 "fake" order the forward epilogue stores (a 4x4
 transpose of 32-bit pairs inside each 32-column group); the epilogue here undoes it with two
 XOR-shuffle stages before one coalesced 128-bit store per row.
+
+The split slabs of the partial buffer may be padded apart. On a GPU with several memory
+locality domains (Rubin uGPU) the caller stripes the buffer so page ``p`` of every slab lives in
+domain ``p % num_domains``, and hands the kernel the domain of every SM: a CTA then claims a tile
+whose pages live in the domain of its own SM, from per-domain counters, and takes a tile of
+another domain only once its own are gone.
 """
 
 import math
+from dataclasses import dataclass
 from typing import Optional, Type
 
 import cutlass
@@ -45,6 +52,27 @@ STAGES = 4
 MAX_SPLIT_SLAB_ELEMENTS = 2**31
 
 
+@dataclass(frozen=True)
+class LocalityHints:
+    """Steer every CTA to the memory locality domain of its SM.
+
+    ``sm_domains`` holds the locality domain of each SM id (``%smid``) as int32, -1 where unknown.
+    ``tile_counters`` holds one int32 per domain, the tile claims of a launch; they must be zero
+    when the launch starts (the forward kernel zeroes them for the combine that follows it).
+    ``page_bytes`` is the granularity at which the partial buffer alternates domains: page ``p``
+    of every split slab lives in domain ``p % num_domains``, which a split stride that is a
+    multiple of ``num_domains * page_bytes`` keeps true for every slab.
+    """
+
+    sm_domains: torch.Tensor
+    tile_counters: torch.Tensor
+    page_bytes: int
+
+    @property
+    def num_domains(self) -> int:
+        return int(self.tile_counters.numel())
+
+
 class SparseAttentionForwardCombine:
     def __init__(
         self,
@@ -57,6 +85,7 @@ class SparseAttentionForwardCombine:
         stages: int = STAGES,
         use_pdl: bool = False,
         min_blocks_per_mp: int = 0,
+        num_domains: int = 0,
     ):
         """Forward combine kernel for split attention computation.
 
@@ -69,6 +98,7 @@ class SparseAttentionForwardCombine:
         :param stages: ring slots of ``tile_m`` partial rows each
         :param use_pdl: wait on the producer grid before reading its outputs
         :param min_blocks_per_mp: CTAs per SM ptxas must leave registers for (0 lets it choose)
+        :param num_domains: memory locality domains the tiles are claimed by (0: tile = CTA index)
         """
         if dtype not in (cutlass.BFloat16, cutlass.Float16):
             raise TypeError("the combine writes BF16 or F16 outputs")
@@ -78,6 +108,8 @@ class SparseAttentionForwardCombine:
             raise ValueError(f"topk must be in [1, 256], got {topk}")
         if num_threads % 32 != 0 or stages < 1:
             raise ValueError("num_threads must be a multiple of 32 and stages at least 1")
+        if num_domains < 0 or num_domains == 1:
+            raise ValueError("num_domains must be 0 (no steering) or at least 2")
         copy_bits = 128
         self.elems_per_copy = copy_bits // dtype_partial.width
         if head_dim % self.elems_per_copy != 0:
@@ -105,6 +137,7 @@ class SparseAttentionForwardCombine:
         self.stages = stages
         self.use_pdl = use_pdl
         self.min_blocks_per_mp = min_blocks_per_mp
+        self.num_domains = num_domains
 
     def _setup_attributes(self):
         copy_bits = 128
@@ -162,6 +195,9 @@ class SparseAttentionForwardCombine:
         mSplitCounts: Optional[cute.Tensor] = None,
         mOutputScale: Optional[cute.Tensor] = None,
         qhead_per_kvhead: Int32 = Int32(1),
+        mSmDomains: Optional[cute.Tensor] = None,
+        mTileCounters: Optional[cute.Tensor] = None,
+        tiles_per_page_log2: Int32 = Int32(0),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -205,19 +241,29 @@ class SparseAttentionForwardCombine:
                 raise ValueError("split_counts tensor must be (total_q, nheads_kv)")
         if const_expr(mOutputScale is not None and mOutputScale.element_type != Float32):
             raise TypeError("output_scale tensor must be Float32")
+        if const_expr((mSmDomains is None) != (mTileCounters is None)):
+            raise ValueError("sm_domains and tile_counters must either both be provided or both be None")
+        if const_expr((mTileCounters is not None) != (self.num_domains > 0)):
+            raise ValueError("tile_counters are required exactly when num_domains is set")
+        if const_expr(
+            mTileCounters is not None
+            and (mSmDomains.element_type != Int32 or mTileCounters.element_type != Int32)
+        ):
+            raise TypeError("sm_domains and tile_counters must be Int32")
 
         mO_partial, mO = [assume_tensor_aligned(t) for t in (mO_partial, mO)]
         num_head = mO_partial.shape[2]
         total_flat = mO_partial.shape[1] * num_head
         self._setup_attributes()
 
-        # Contiguous (num_splits, total_q, nheads, headdim) as (headdim, flat row, split): a
-        # (headdim, tile_m) box is one tile of one split.
+        # (num_splits, total_q, nheads, headdim) with contiguous slabs as (headdim, flat row,
+        # split): a (headdim, tile_m) box is one tile of one split. The slabs keep their own
+        # stride, which may be padded.
         mO_partial_tma = cute.make_tensor(
             mO_partial.iterator,
             cute.make_layout(
                 (self.head_dim, total_flat, self.topk),
-                stride=(1, self.head_dim, self.head_dim * total_flat),
+                stride=(1, self.head_dim, mO_partial.stride[0]),
             ),
         )
         tma_atom_O_partial, mO_partial_tma = cpasync.make_tiled_tma_atom(
@@ -271,6 +317,7 @@ class SparseAttentionForwardCombine:
             ]
             sRingMbar: cute.struct.Align[cute.struct.MemRange[Int64, self.stages], 8]
             sLseMbar: cute.struct.Align[cute.struct.MemRange[Int64, 1], 8]
+            sTile: cute.struct.Align[cute.struct.MemRange[Int32, 1], 8]
 
         grid_dim = (cute.ceil_div(total_flat, self.tile_m), 1, 1)
         self.kernel(
@@ -283,6 +330,9 @@ class SparseAttentionForwardCombine:
             mSplitCounts,
             mOutputScale,
             qhead_per_kvhead,
+            mSmDomains,
+            mTileCounters,
+            tiles_per_page_log2,
             tma_atom_O_partial,
             tma_atom_LSE,
             tma_atom_LSE_temperature,
@@ -317,6 +367,9 @@ class SparseAttentionForwardCombine:
         mSplitCounts: Optional[cute.Tensor],
         mOutputScale: Optional[cute.Tensor],
         qhead_per_kvhead: Int32,
+        mSmDomains: Optional[cute.Tensor],
+        mTileCounters: Optional[cute.Tensor],
+        tiles_per_page_log2: Int32,
         tma_atom_O_partial: cute.CopyAtom,
         tma_atom_LSE: cute.CopyAtom,
         tma_atom_LSE_temperature: Optional[cute.CopyAtom],
@@ -334,9 +387,10 @@ class SparseAttentionForwardCombine:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         m_block, _, _ = cute.arch.block_idx()
-        tile_begin = m_block * self.tile_m
+        total_tiles, _, _ = cute.arch.grid_dim()
         total_flat = mO.shape[0] * mO.shape[1]
         has_temperature = const_expr(mLSE_temperature_partial_tma is not None)
+        steer_tiles = const_expr(mTileCounters is not None)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -352,14 +406,24 @@ class SparseAttentionForwardCombine:
         sO_tma = storage.sO.get_tensor(smem_layout_o_tma)
         ring_mbar = storage.sRingMbar.data_ptr()
         lse_mbar = storage.sLseMbar.data_ptr()
+        sTile = storage.sTile.get_tensor((1,))
 
-        # Barriers are CTA-local state: set them up while the producer grid is still draining.
+        # Barriers are CTA-local state, and the tile claim depends on nothing the producer grid
+        # writes (it zeroed the counters at its start): both happen while that grid is still
+        # draining.
         if tidx == 0:
             for stage in cutlass.range(self.stages, unroll_full=True):
                 cute.arch.mbarrier_init(ring_mbar + stage, 1)
             cute.arch.mbarrier_init(lse_mbar, 1)
             cute.arch.mbarrier_init_fence()
+            if const_expr(steer_tiles):
+                sTile[0] = self.claim_tile(
+                    mSmDomains, mTileCounters, total_tiles, tiles_per_page_log2
+                )
         cute.arch.sync_threads()
+        if const_expr(steer_tiles):
+            m_block = sTile[0]
+        tile_begin = m_block * self.tile_m
         if const_expr(use_pdl):
             cute.arch.griddepcontrol_wait()
 
@@ -674,6 +738,47 @@ class SparseAttentionForwardCombine:
                     k_idx = tOcO_store[0, 0, k][1] // elems_per_store
                     cute.copy(thr_copy_out, rO[None, m, k], mO_row[None, k_idx])
 
+    @cute.jit
+    def claim_tile(
+        self,
+        mSmDomains: cute.Tensor,
+        mTileCounters: cute.Tensor,
+        total_tiles: Int32,
+        tiles_per_page_log2: Int32,
+    ) -> Int32:
+        """One tile for this CTA, from the domain of its SM while that domain has tiles left.
+
+        Tiles are dealt to domains by page: page ``j`` (``2 ** tiles_per_page_log2`` tiles)
+        belongs to domain ``j % num_domains``, so the ``k``-th tile of domain ``d`` is tile
+        ``k % page`` of page ``(k // page) * num_domains + d``. Each counter hands out claims in
+        order; a claim past the domain's tile count moves on to the next domain, and since the
+        grid holds exactly one CTA per tile, the claims of all domains together always fit.
+        """
+        num_domains = const_expr(self.num_domains)
+        sm_id = cute.arch.smid()
+        domain = mSmDomains[sm_id]
+        if domain < 0:
+            domain = sm_id % Int32(num_domains)
+        page_tiles = Int32(1) << tiles_per_page_log2
+        full_pages = total_tiles >> tiles_per_page_log2
+        tail_tiles = total_tiles & (page_tiles - 1)
+        tile = Int32(-1)
+        for _ in cutlass.range_constexpr(num_domains):
+            if tile < 0:
+                claim = cute.arch.atomic_add(mTileCounters.iterator + domain, Int32(1))
+                domain_pages = full_pages // Int32(num_domains)
+                if full_pages % Int32(num_domains) > domain:
+                    domain_pages = domain_pages + 1
+                domain_tiles = domain_pages << tiles_per_page_log2
+                if full_pages % Int32(num_domains) == domain:
+                    domain_tiles = domain_tiles + tail_tiles
+                if claim < domain_tiles:
+                    page = (claim >> tiles_per_page_log2) * Int32(num_domains) + domain
+                    tile = (page << tiles_per_page_log2) + (claim & (page_tiles - 1))
+                else:
+                    domain = (domain + 1) % Int32(num_domains)
+        return tile
+
 
 
 _combine_compile_cache = {}
@@ -685,13 +790,17 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
     return torch2cute_dtype_map[torch_dtype]
 
 
-def _check_cuda_contiguous(tensor: torch.Tensor, *, name: str, device: torch.device) -> None:
+def _check_cuda_aligned(tensor: torch.Tensor, *, name: str, device: torch.device) -> None:
     if tensor.device != device:
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
     if tensor.data_ptr() % 16:
         raise ValueError(f"{name} must be 16-byte aligned")
+
+
+def _check_cuda_contiguous(tensor: torch.Tensor, *, name: str, device: torch.device) -> None:
+    _check_cuda_aligned(tensor, name=name, device=device)
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
 
 
 def combine(
@@ -705,6 +814,7 @@ def combine(
     split_counts=None,
     output_scale=None,
     use_pdl=False,
+    locality=None,
 ):
     """K2: merge the sparse forward's split partials into the final output.
 
@@ -713,8 +823,9 @@ def combine(
     log-sum-exp of each row into it.
 
     Args:
-        o_partial_fake: [num_splits, total_q, head_q, 128] BF16 or F16, contiguous, columns in
-            the forward epilogue's STG.128 order.
+        o_partial_fake: [num_splits, total_q, head_q, 128] BF16 or F16, columns in the forward
+            epilogue's STG.128 order; the rows of a split slab are contiguous, the slabs may be
+            padded apart (any 16-byte-aligned split stride).
         lse_partial: [num_splits, total_q, head_q] FP32, contiguous.
         o_out: [total_q, head_q, 128] BF16 or F16, contiguous.
         lse_out: [total_q, head_q] FP32, or None.
@@ -725,6 +836,8 @@ def combine(
         output_scale: optional FP32 tensor with at least one element; its first element scales
             the output once before the store.
         use_pdl: wait on the producer grid (programmatic dependent launch) before reading.
+        locality: optional :class:`LocalityHints` for a partial buffer striped over the memory
+            locality domains; every CTA then reads its tile from the domain of its own SM.
     """
     if o_partial_fake.ndim != 4:
         raise ValueError(
@@ -737,10 +850,16 @@ def combine(
         raise ValueError(f"num_splits must be in [1, 256], got {num_splits}")
     if head_q % 4:
         raise ValueError(f"head_q must be a multiple of 4, got {head_q}")
-    if total_q * head_q * dim >= MAX_SPLIT_SLAB_ELEMENTS:
+    split_stride = o_partial_fake.stride(0)
+    if o_partial_fake.stride()[1:] != (head_q * dim, dim, 1) or split_stride < total_q * head_q * dim:
         raise ValueError(
-            f"total_q * head_q * dim must be below {MAX_SPLIT_SLAB_ELEMENTS} elements per split"
+            "o_partial_fake rows must be contiguous inside each split slab, with a split stride "
+            f"of at least {total_q * head_q * dim} elements, got strides {o_partial_fake.stride()}"
         )
+    if split_stride % (128 // (8 * o_partial_fake.element_size())):
+        raise ValueError("the o_partial_fake split stride must keep 16-byte alignment")
+    if split_stride >= MAX_SPLIT_SLAB_ELEMENTS:
+        raise ValueError(f"the o_partial_fake split stride must be below {MAX_SPLIT_SLAB_ELEMENTS}")
     if o_partial_fake.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(
             f"o_partial_fake dtype must be torch.bfloat16 or torch.float16, got {o_partial_fake.dtype}"
@@ -802,8 +921,8 @@ def combine(
     device = o_out.device
     if not o_out.is_cuda:
         raise ValueError("o_out must be a CUDA tensor")
+    _check_cuda_aligned(o_partial_fake, name="o_partial_fake", device=device)
     for name, tensor in (
-        ("o_partial_fake", o_partial_fake),
         ("lse_partial", lse_partial),
         ("o_out", o_out),
         ("lse_out", lse_out),
@@ -822,6 +941,31 @@ def combine(
     has_split_counts = split_counts is not None
     has_output_scale = output_scale is not None
     qhead_per_kvhead = head_q // split_counts.shape[1] if has_split_counts else 1
+    num_domains = 0
+    tiles_per_page_log2 = 0
+    if locality is not None:
+        num_domains = locality.num_domains
+        if num_domains < 2:
+            raise ValueError("locality hints need at least two domains")
+        for name, tensor in (
+            ("locality.sm_domains", locality.sm_domains),
+            ("locality.tile_counters", locality.tile_counters),
+        ):
+            _check_cuda_contiguous(tensor, name=name, device=device)
+            if tensor.dtype != torch.int32 or tensor.ndim != 1:
+                raise TypeError(f"{name} must be a one-dimensional torch.int32 tensor")
+        tile_bytes = TILE_M * dim * o_partial_fake.element_size()
+        tiles_per_page, page_rest = divmod(locality.page_bytes, tile_bytes)
+        if page_rest or tiles_per_page & (tiles_per_page - 1):
+            raise ValueError(
+                f"locality.page_bytes must be a power-of-two multiple of the {tile_bytes}-byte tile"
+            )
+        tiles_per_page_log2 = tiles_per_page.bit_length() - 1
+        if (split_stride * o_partial_fake.element_size()) % (num_domains * locality.page_bytes):
+            raise ValueError(
+                "the o_partial_fake split stride must be a multiple of num_domains x page_bytes "
+                "so the pages of every slab fall into the same domains"
+            )
     capability = torch.cuda.get_device_capability(device)
 
     key = (
@@ -839,6 +983,7 @@ def combine(
         has_split_counts,
         has_output_scale,
         use_pdl,
+        num_domains,
     )
     if key not in _combine_compile_cache:
         loaded = try_load_aot(key)
@@ -856,6 +1001,7 @@ def combine(
                 num_threads=NUM_THREADS,
                 stages=STAGES,
                 use_pdl=use_pdl,
+                num_domains=num_domains,
             )
             total_q_sym, nheads_sym = (cute.sym_int64() for _ in range(2))
             mO_partial = make_fake_tensor(
@@ -898,6 +1044,14 @@ def combine(
                 if has_output_scale
                 else None
             )
+            mSmDomains, mTileCounters = (
+                (
+                    make_fake_tensor(Int32, (cute.sym_int64(),), divisibility=1, leading_dim=0),
+                    make_fake_tensor(Int32, (num_domains,), divisibility=1, leading_dim=0),
+                )
+                if num_domains
+                else (None, None)
+            )
             stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
             _combine_compile_cache[key] = compile_with_timing(
                 kernel,
@@ -910,6 +1064,9 @@ def combine(
                 mSplitCounts,
                 mOutputScale,
                 Int32(qhead_per_kvhead),
+                mSmDomains,
+                mTileCounters,
+                Int32(tiles_per_page_log2),
                 stream,
                 options="--enable-tvm-ffi",
             )
@@ -926,4 +1083,7 @@ def combine(
             split_counts,
             output_scale,
             qhead_per_kvhead,
+            None if locality is None else locality.sm_domains,
+            None if locality is None else locality.tile_counters,
+            tiles_per_page_log2,
         )

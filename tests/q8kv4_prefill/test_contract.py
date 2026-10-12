@@ -6,7 +6,7 @@
 import pytest
 import torch
 
-from fmha_sm100.prefill_q8kv4 import BatchPrefillWithPagedKVCacheWrapper
+from fmha_sm100.prefill_q8kv4 import BatchPrefillWithPagedKVCacheWrapper, PrefillWorkspace
 
 from .cases import PAGE_SIZE, SMOKE_CASES, global_scale, make_inputs, query_positions
 from .reference import assert_close_to_reference, sparse_prefill_reference
@@ -45,6 +45,51 @@ def test_selection_lists_follow_the_list(device, kind):
     assert_close_to_reference(out, reference, label=f"contract {kind}", lse=lse, reference_lse=reference_lse)
     if kind == "empty":
         assert not out.any() and torch.isinf(lse).all()
+
+
+def test_workspace_serves_batches_in_turn(device):
+    """One split workspace carries batches of growing size through separate wrappers, and its
+    partial slabs follow the device's locality-domain stripe."""
+    workspace = PrefillWorkspace(device)
+    for case in (SMOKE_CASES[0], SMOKE_CASES[1]):
+        inputs = make_inputs(case, device)
+        out, lse = run_wrapper(inputs, label=f"workspace {case.name}", plan_kwargs={"workspace": workspace})
+        reference, reference_lse = sparse_prefill_reference(inputs)
+        assert_close_to_reference(out, reference, label=f"workspace {case.name}", lse=lse,
+                                  reference_lse=reference_lse)
+    o_partial, lse_partial, locality = workspace.split_buffers(16, 333, 64)
+    assert tuple(o_partial.shape) == (16, 333, 64, 128) and tuple(lse_partial.shape) == (16, 333, 64)
+    assert o_partial.stride()[1:] == (64 * 128, 128, 1)
+    if workspace.num_domains > 1:
+        assert locality is not None and locality.num_domains == workspace.num_domains
+        assert (o_partial.stride(0) * 2) % (locality.num_domains * locality.page_bytes) == 0
+        assert locality.tile_counters.numel() == locality.num_domains
+    else:
+        assert locality is None and o_partial.is_contiguous()
+    with pytest.raises(ValueError, match="CUDA device"):
+        PrefillWorkspace("cpu")
+
+
+def test_workspace_falls_back_when_localized_memory_is_unavailable(device, monkeypatch):
+    """A device that counts locality domains but cannot place memory in them keeps the
+    interleaved workspace, and the batch still runs."""
+    from fmha_sm100.prefill_q8kv4 import interface
+
+    workspace = PrefillWorkspace(device)
+    if workspace.num_domains == 1:
+        pytest.skip("device exposes one locality domain")
+    extension = interface.load_extension(device, 0)
+
+    def refuse(nbytes, index):
+        raise RuntimeError("localized memory refused for the test")
+
+    monkeypatch.setattr(extension, "alloc_locality_striped", refuse)
+    o_partial, _, locality = workspace.split_buffers(16, 333, 64)
+    assert locality is None and workspace.num_domains == 1 and o_partial.is_contiguous()
+    inputs = make_inputs(CASE, device)
+    out, lse = run_wrapper(inputs, label="workspace fallback", plan_kwargs={"workspace": workspace})
+    reference, reference_lse = sparse_prefill_reference(inputs)
+    assert_close_to_reference(out, reference, label="workspace fallback", lse=lse, reference_lse=reference_lse)
 
 
 def test_plan_rejects_invalid_metadata(device):

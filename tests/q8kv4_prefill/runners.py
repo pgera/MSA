@@ -19,10 +19,11 @@ def plan_wrapper(
     flat: bool = False,
     topk_indices: torch.Tensor | None = None,
     sm_scale: float = SM_SCALE,
+    workspace=None,
     **plan_kwargs,
 ) -> BatchPrefillWithPagedKVCacheWrapper:
     case = inputs.case
-    wrapper = BatchPrefillWithPagedKVCacheWrapper()
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace=workspace)
     wrapper.plan(
         inputs.topk_indices if topk_indices is None else topk_indices,
         inputs.cu_seqlens_q,

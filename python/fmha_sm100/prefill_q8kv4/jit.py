@@ -162,6 +162,7 @@ class JitSpec:
             "sources": [
                 str(_API / "prefill_attention_api.cpp"),
                 str(_API / "prefill_attention_binding.cpp"),
+                str(_API / "locality_domains.cu"),
                 str(cache_dir / "prefill_attention_inst.cu"),
             ],
             "extra_include_paths": [

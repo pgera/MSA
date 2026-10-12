@@ -4,7 +4,9 @@
 """The split combine on its own: random partials and partial LSEs merged against an FP32 torch
 reference, with NaN in every partial slot past a row's valid split count so a masking defect
 shows up as a non-finite output. Covers the split counts, head counts, partial and output
-dtypes, the temperature LSE and the output scale the forward kernels can hand it."""
+dtypes, the temperature LSE and the output scale the forward kernels can hand it, padded split
+slabs, and the per-domain tile claiming of a locality-striped workspace (with a synthetic SM
+table, so it runs on any GPU)."""
 
 from __future__ import annotations
 
@@ -34,7 +36,15 @@ class CombineCase:
     lse_out: bool = True
     temperature: bool = False
     output_scale: bool = False
+    # Pad every split slab to a multiple of this many flat rows (0: contiguous slabs).
+    slab_rows: int = 0
+    # Claim tiles per memory locality domain over a synthetic SM table (0: tile = CTA index).
+    domains: int = 0
 
+
+# One 2 MB page of 256-byte rows: the stripe granularity of a locality-domain workspace.
+PAGE_BYTES = 2 << 20
+PAGE_ROWS = PAGE_BYTES // (HEAD_DIM * 2)
 
 CASES = (
     CombineCase("h64_topk16", 333, 4, 16),
@@ -45,6 +55,10 @@ CASES = (
     CombineCase("h64_topk32_temperature_scale", 129, 4, 32, temperature=True, output_scale=True),
     CombineCase("h64_topk16_every_split", 65, 4, 16, split_counts=False, lse_out=False),
     CombineCase("one_query_f16_out", 1, 1, 16, out_dtype=torch.float16),
+    CombineCase("h64_topk16_padded_slabs", 333, 4, 16, slab_rows=1024),
+    CombineCase("h64_topk16_two_domains", 333, 4, 16, slab_rows=2 * PAGE_ROWS, domains=2),
+    CombineCase("h16_topk8_two_domains_partial_tile", 171, 1, 8, slab_rows=2 * PAGE_ROWS,
+                domains=2),
 )
 
 
@@ -105,10 +119,24 @@ def test_combine_merges_the_valid_splits(case: CombineCase, device: torch.device
     ref_out, ref_lse = _reference(partial_real, lse_partial, valid, output_scale.item() if case.output_scale else 1.0)
     ref_lse_temperature = _reference(partial_real, lse_temperature_partial, valid, 1.0)[1] if case.temperature else None
 
-    # The kernel's inputs: fake column order, and NaN wherever a split is past the row's count.
-    o_partial = torch.empty_like(partial_real)
+    # The kernel's inputs: fake column order, and NaN wherever a split is past the row's count
+    # (and in the slab padding, which no tile may read).
+    flat_rows = case.total_q * heads
+    slab_rows = flat_rows if case.slab_rows == 0 else -(-flat_rows // case.slab_rows) * case.slab_rows
+    o_partial = torch.full((case.topk * slab_rows * HEAD_DIM,), math.nan, dtype=case.partial_dtype,
+                           device=device).as_strided((case.topk, case.total_q, heads, HEAD_DIM),
+                                                     (slab_rows * HEAD_DIM, heads * HEAD_DIM, HEAD_DIM, 1))
     o_partial[..., _real_to_fake_col(device)] = partial_real
     _nan_fill(o_partial, ~valid)
+    locality = None
+    if case.domains:
+        from src.blackwell_prefill.combine import LocalityHints
+
+        locality = LocalityHints(
+            sm_domains=torch.arange(4096, dtype=torch.int32, device=device) % case.domains,
+            tile_counters=torch.zeros(case.domains, dtype=torch.int32, device=device),
+            page_bytes=PAGE_BYTES,
+        )
     lse_in = lse_partial.clone()
     _nan_fill(lse_in, ~valid)
     lse_temperature_in = None
@@ -120,9 +148,11 @@ def test_combine_merges_the_valid_splits(case: CombineCase, device: torch.device
     lse_temperature_out = torch.empty_like(lse_out) if case.temperature else None
 
     def run():
+        if locality is not None:  # zero at launch is the contract; the forward kernel does it in production
+            locality.tile_counters.zero_()
         combine(o_partial, lse_in, out, lse_out, lse_temperature_partial=lse_temperature_in,
                 lse_temperature_out=lse_temperature_out, split_counts=split_counts,
-                output_scale=output_scale, use_pdl=True)
+                output_scale=output_scale, use_pdl=True, locality=locality)
         return out.clone(), None if lse_out is None else lse_out.clone(), (
             None if lse_temperature_out is None else lse_temperature_out.clone())
 
@@ -130,6 +160,8 @@ def test_combine_merges_the_valid_splits(case: CombineCase, device: torch.device
     second = run()
     torch.cuda.synchronize()
 
+    if locality is not None:  # every CTA claimed exactly once
+        assert sum(locality.tile_counters.tolist()) >= -(-case.total_q * heads // 64)
     assert torch.isfinite(first[0]).all(), "a stale partial reached the output"
     # The output is the FP32 merge rounded once to the output dtype.
     torch.testing.assert_close(first[0].float(), ref_out, rtol=1e-2, atol=2e-2)

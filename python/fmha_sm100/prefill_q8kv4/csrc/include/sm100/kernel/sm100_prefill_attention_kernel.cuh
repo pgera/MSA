@@ -50,12 +50,24 @@ void prefill_attention_kernel(
 
   if (tid == 0) {
     initialize_work_tile(storage, arguments);
+    if (blockIdx.x == 0 && arguments.combine_tile_counters_ptr != nullptr) {
+      for (int i = 0; i < arguments.combine_tile_counter_count; ++i) {
+        arguments.combine_tile_counters_ptr[i] = 0;
+      }
+      __threadfence();
+    }
   }
   if (warp_idx == 0) {
     initialize_pipeline_barriers(storage);
   }
   cutlass::arch::fence_barrier_init();
   __syncthreads();
+  // Every CTA of this grid has started once the last one reaches this point, so the dependent
+  // grid (the combine) can be staged now: its CTAs fill the SMs this grid's CTAs leave, run their
+  // prologue, and wait for this grid's completion before reading anything it writes.
+  if (tid == 0) {
+    cutlass::arch::launch_dependent_grids();
+  }
 
   cutlass::arch::NamedBarrier tmem_barrier(
       WarpSpecialization::kTmemParticipantWarps * 32, kTmemBarrierId);
