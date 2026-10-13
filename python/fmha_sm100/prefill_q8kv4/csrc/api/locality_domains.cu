@@ -50,7 +50,26 @@ CUdevice driver_device(int device) {
   return cu_device;
 }
 
+// cuDevSmResourceSplit is a CUDA 13.4 driver entry point. Resolving it at run time keeps this
+// extension loadable on older drivers (CUDA 13.0 to 13.3), where locality-domain striping is simply
+// unavailable; the green-context and virtual-memory calls below predate it.
+decltype(&cuDevSmResourceSplit) sm_resource_split() {
+  static decltype(&cuDevSmResourceSplit) const function = [] {
+    void *address = nullptr;
+    CUdriverProcAddressQueryResult status = CU_GET_PROC_ADDRESS_SUCCESS;
+    CUresult const result = cuGetProcAddress("cuDevSmResourceSplit", &address, 13040,
+                                             CU_GET_PROC_ADDRESS_DEFAULT, &status);
+    return result == CUDA_SUCCESS && status == CU_GET_PROC_ADDRESS_SUCCESS
+               ? reinterpret_cast<decltype(&cuDevSmResourceSplit)>(address)
+               : nullptr;
+  }();
+  return function;
+}
+
 int domain_count(int device) {
+  if (sm_resource_split() == nullptr) {
+    return 1;
+  }
   int count = 0;
   CUresult const result = cuDeviceGetAttribute(
       &count, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, driver_device(device));
@@ -133,8 +152,8 @@ std::vector<CUdevResource> split_sms_by_domain(CUdevice cu_device, int num_domai
   }
   std::vector<CUdevResource> groups(num_domains);
   CUdevResource remainder{};
-  check_driver(cuDevSmResourceSplit(groups.data(), static_cast<unsigned int>(num_domains), &all_sms,
-                                    &remainder, 0, group_params.data()),
+  check_driver(sm_resource_split()(groups.data(), static_cast<unsigned int>(num_domains), &all_sms,
+                                   &remainder, 0, group_params.data()),
                "cuDevSmResourceSplit");
   return groups;
 }
