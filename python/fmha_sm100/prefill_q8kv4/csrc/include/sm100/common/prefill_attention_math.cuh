@@ -334,6 +334,7 @@ CUTLASS_DEVICE void store_partial_output_pass(RegTensor const &rOPass,
 template <class TiledMmaPV, class OutputTensor, class CoordinateTensor>
 CUTLASS_DEVICE void
 store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor cO,
+                     uint64_t *output_empty, uint64_t *stats_empty,
                      cutlass::bfloat16_t *o_partial_ptr, int64_t o_partial_split_stride,
                      float *lse_partial_ptr, int total_q, int num_q_heads,
                      float softmax_scale_log2, float output_scale, int head_kv,
@@ -354,8 +355,11 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor 
   auto views1 = partial_output_pass_views<1>(tiled_mma_pv, tO, cO, group_thread);
 
   // The four rows this thread stores (see store_partial_output_pass): rows[row_index][half]
-  // is the row of column groups 2 * half and 2 * half + 1 of that row index.
+  // is the row of column groups 2 * half and 2 * half + 1 of that row index. This thread's LSE
+  // row stats are read here too, before the stats stage is handed back to the softmax.
   Tensor cOMn = make_16x256b_tensor_mn_view(get<2>(views0))(_, _, _0{});
+  float const lse_sum = row_sum[group_thread];
+  float const lse_max = row_max[group_thread];
   PartialRowState rows[2][2];
   CUTLASS_PRAGMA_UNROLL
   for (int row_index = 0; row_index < 2; ++row_index) {
@@ -378,9 +382,12 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor 
       rows[row_index][half].valid = qi < q_count;
     }
   }
+  // Every stat this thread needs is in registers: the softmax may publish the next group's.
+  cutlass::arch::ClusterBarrier::arrive(stats_empty);
 
   // One 64-column half at a time: the epilogue register budget (96) holds one half's 32
-  // accumulators plus the row state, not both halves.
+  // accumulators plus the row state, not both halves. The O stage is handed back to the MMA as
+  // soon as its second half is in registers, before this group's stores drain.
   {
     Tensor rO0 = make_tensor<Accumulator>(shape(get<2>(views0)));
     copy(get<0>(views0), get<1>(views0), rO0);
@@ -391,6 +398,7 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor 
     Tensor rO1 = make_tensor<Accumulator>(shape(get<2>(views1)));
     copy(get<0>(views1), get<1>(views1), rO1);
     cutlass::arch::fence_view_async_tmem_load();
+    cutlass::arch::ClusterBarrier::arrive(output_empty);
     store_partial_output_pass<1>(rO1, get<2>(views1), rows);
   }
 
@@ -403,11 +411,10 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor 
     int const split = decode_split_idx(packed_qsplit);
     int const q_abs = q_batch_offset + q_idx;
     int const lse_head = head_kv * kQHeadsPerKv + row % kQHeadsPerKv;
-    float const sum = row_sum[row];
     float lse = -INFINITY;
-    if (sum > 0.0f && isfinite(row_max[row])) {
+    if (lse_sum > 0.0f && isfinite(lse_max)) {
       constexpr float kLn2 = 0.6931471805599453f;
-      lse = (row_max[row] * softmax_scale_log2 + log2_approx_ftz(sum) - kLog2Fp8ProbabilityScale) *
+      lse = (lse_max * softmax_scale_log2 + log2_approx_ftz(lse_sum) - kLog2Fp8ProbabilityScale) *
             kLn2;
     }
     int64_t const lse_offset =

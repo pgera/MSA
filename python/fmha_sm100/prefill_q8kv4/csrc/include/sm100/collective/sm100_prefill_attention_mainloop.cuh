@@ -489,17 +489,18 @@ CUTLASS_DEVICE void run_epilogue_warpgroup(Storage &storage, PrefillArguments co
     cute::wait_barrier(storage.stats_full[score_stage], score_phase);
     Tensor tOCurrent = tO;
     tOCurrent.data() = storage.tmem_base + kTmemOutputOffset + score_stage * kTmemOutputStride;
-    store_partial_output(tiled_mma_pv, tOCurrent, cO, arguments.o_partial_ptr,
+    // output_empty and stats_empty expect one arrival per epilogue thread; store_partial_output
+    // arrives on each as soon as that thread no longer needs the stage (after its own TMEM-load
+    // fence for O), so no warpgroup barrier is needed and the MMA can refill the stage while
+    // this group's stores drain.
+    store_partial_output(tiled_mma_pv, tOCurrent, cO, &storage.output_empty[score_stage],
+                         &storage.stats_empty[score_stage], arguments.o_partial_ptr,
                          arguments.o_partial_split_stride, arguments.lse_partial_ptr,
                          arguments.total_q, arguments.num_q_heads,
                          storage.work_tile.softmax_scale_log2, storage.work_tile.output_scale,
                          head_kv, q_count, q_batch_offset, group,
                          group_thread, storage.qsplit_indices[metadata_stage],
                          storage.row_sum[score_stage], storage.row_max[score_stage]);
-    // output_empty and stats_empty expect one arrival per epilogue thread, each after its own
-    // TMEM-load fence, so no warpgroup barrier is needed before releasing the stage.
-    cutlass::arch::ClusterBarrier::arrive(&storage.output_empty[score_stage]);
-    cutlass::arch::ClusterBarrier::arrive(&storage.stats_empty[score_stage]);
   }
 
   cutlass::arch::NamedBarrier tmem_barrier(WarpSpecialization::kTmemParticipantWarps * 32,
