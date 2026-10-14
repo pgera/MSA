@@ -59,12 +59,10 @@ def _to_cute_int32_metadata(t: torch.Tensor):
     return to_cute_tensor_kvouter(t, assumed_align=4)
 
 
-def _select_combine(partial_dtype: torch.dtype, head_q: int, cu_seqlens: torch.Tensor):
-    """The default combine streams BF16/FP16 partials through TMA over the flat (query, head)
-    rows, which keeps every split's FP32 LSE slab 16-byte aligned only for a head count that
-    is a multiple of 4. FP32 / FP8 E4M3 partials and other head counts run on combine_f32f8,
-    which walks the varlen rows by cu_seqlens."""
-    if partial_dtype in (torch.bfloat16, torch.float16) and head_q % 4 == 0:
+def _select_combine(partial_dtype: torch.dtype, cu_seqlens: torch.Tensor):
+    """BF16/FP16 partials run on the default combine, which schedules the flat varlen rows
+    by itself; FP32 / FP8 E4M3 partials run on combine_f32f8, which walks them by cu_seqlens."""
+    if partial_dtype in (torch.bfloat16, torch.float16):
         return combine
     return functools.partial(combine_f32f8, cu_seqlens=cu_seqlens)
 
@@ -694,7 +692,7 @@ def _try_blackwell_sparse_prefill(
         k2q_row_ptr, k2q_q_indices, schedule, partial, stats,
         softmax_scale=softmax_scale, max_seqlen_q=max_seqlen_q, seqused_k=seqused_k,
     )
-    _select_combine(partial.dtype, q.shape[1], cu_seqlens_q)(
+    combine(
         partial, stats, out, None,
         split_counts=schedule.split_counts, use_pdl=True, output_scale=output_scale,
     )
@@ -1141,7 +1139,7 @@ def sparse_atten_nvfp4_kv_func(
         kv_layout=kv_layout,
     )
 
-    _select_combine(O_partial.dtype, O_partial.shape[2], cu_seqlens_q)(
+    _select_combine(O_partial.dtype, cu_seqlens_q)(
         O_partial,
         LSE_partial,
         O_out,
@@ -1711,7 +1709,7 @@ def _sparse_atten_csr_varlen_forward(
     )
     # Sparse Attention and Sparse Page Attention both use the varlen-Q
     # combine path; the kernel-written LSE_out is the final contract.
-    _select_combine(O_partial.dtype, O_partial.shape[2], cu_seqlens_q)(
+    _select_combine(O_partial.dtype, cu_seqlens_q)(
         O_partial,
         LSE_partial,
         O_out,

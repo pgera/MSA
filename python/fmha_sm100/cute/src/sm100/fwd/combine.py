@@ -1598,6 +1598,7 @@ class SparseAttentionForwardCombine:
         use_pdl: bool = False,
         min_blocks_per_mp: int = 0,
         num_domains: int = 0,
+        lse_split_aligned: bool = True,
     ):
         """Forward combine kernel for split attention computation.
 
@@ -1610,6 +1611,10 @@ class SparseAttentionForwardCombine:
         :param stages: ring slots of ``tile_m`` partial rows each
         :param use_pdl: wait on the producer grid before reading its outputs
         :param min_blocks_per_mp: CTAs per SM ptxas must leave registers for (0 lets it choose)
+        :param lse_split_aligned: the LSE partial slabs start 16-byte aligned (the flat row count is
+            a multiple of 4), so one 2-D bulk-tensor copy loads a tile's LSEs of every split;
+            otherwise the threads bring the tile in with 4-byte cp.async copies, since TMA needs
+            a 16-byte aligned split stride and box start
         :param num_domains: memory locality domains the tiles are claimed by (0: tile = CTA index)
         """
         if dtype not in (cutlass.BFloat16, cutlass.Float16):
@@ -1650,6 +1655,7 @@ class SparseAttentionForwardCombine:
         self.use_pdl = use_pdl
         self.min_blocks_per_mp = min_blocks_per_mp
         self.num_domains = num_domains
+        self.lse_split_aligned = lse_split_aligned
 
     def _setup_attributes(self):
         copy_bits = 128
@@ -1679,6 +1685,16 @@ class SparseAttentionForwardCombine:
             cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32),
             s2r_thr_layout,
             cute.make_layout(1),
+        )
+        # Unaligned LSE slabs: every thread brings topk / lse_threads_per_row splits of one row in
+        # with 4-byte cp.async copies; consecutive threads take consecutive rows of a split.
+        g2s_thr_layout = cute.make_ordered_layout(
+            (self.tile_m, self.lse_threads_per_row), order=(0, 1)
+        )
+        self.g2s_tiled_copy_lse = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cpasync.CopyG2SOp(), Float32, num_bits_per_copy=Float32.width),
+            g2s_thr_layout,
+            cute.make_layout((1, self.topk // self.lse_threads_per_row)),
         )
         # The bulk copy writes the tile as a (row, split) box over the same bytes; the trailing
         # mode is the single stage the TMA partition idiom expects.
@@ -1784,30 +1800,32 @@ class SparseAttentionForwardCombine:
             cute.select(self.smem_layout_o_tma, mode=[0, 1]),
             (self.head_dim, self.tile_m),
         )
-        # Contiguous (num_splits, total_q, nheads) as (flat row, split): a (tile_m, num_splits)
-        # box is a CTA's whole LSE tile.
-        mLSE_partial_tma = cute.make_tensor(
-            mLSE_partial.iterator,
-            cute.make_layout((total_flat, self.topk), stride=(1, total_flat)),
-        )
-        tma_atom_LSE, mLSE_partial_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(),
-            mLSE_partial_tma,
-            cute.select(self.smem_layout_lse_tma, mode=[0, 1]),
-            (self.tile_m, self.topk),
-        )
+        num_m_blocks = cute.ceil_div(total_flat, self.tile_m)
+
+        def make_lse_tma(mLSE_src: cute.Tensor):
+            """The contiguous (num_splits, total_q, nheads) LSE partials as (flat row, split). With
+            aligned slabs, a TMA atom whose (tile_m, num_splits) box is a CTA's whole LSE tile and
+            its coordinate tensor; otherwise no atom and the plain view, which the threads copy
+            with cp.async (TMA rejects a split stride or a box start that is not 16-byte aligned)."""
+            mLSE_2d = cute.make_tensor(
+                mLSE_src.iterator,
+                cute.make_layout((total_flat, self.topk), stride=(1, total_flat)),
+            )
+            if const_expr(not self.lse_split_aligned):
+                return None, mLSE_2d
+            return cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mLSE_2d,
+                cute.select(self.smem_layout_lse_tma, mode=[0, 1]),
+                (self.tile_m, self.topk),
+            )
+
+        tma_atom_LSE, mLSE_partial_tma = make_lse_tma(mLSE_partial)
         tma_atom_LSE_temperature = None
         mLSE_temperature_partial_tma = None
         if const_expr(mLSE_temperature_partial is not None):
-            mLSE_temperature_partial_tma = cute.make_tensor(
-                mLSE_temperature_partial.iterator,
-                cute.make_layout((total_flat, self.topk), stride=(1, total_flat)),
-            )
-            tma_atom_LSE_temperature, mLSE_temperature_partial_tma = cpasync.make_tiled_tma_atom(
-                cpasync.CopyBulkTensorTileG2SOp(),
-                mLSE_temperature_partial_tma,
-                cute.select(self.smem_layout_lse_tma, mode=[0, 1]),
-                (self.tile_m, self.topk),
+            tma_atom_LSE_temperature, mLSE_temperature_partial_tma = make_lse_tma(
+                mLSE_temperature_partial
             )
 
         lse_tile_elems = cute.cosize(self.smem_layout_lse)
@@ -1831,7 +1849,7 @@ class SparseAttentionForwardCombine:
             sLseMbar: cute.struct.Align[cute.struct.MemRange[Int64, 1], 8]
             sTile: cute.struct.Align[cute.struct.MemRange[Int32, 1], 8]
 
-        grid_dim = (cute.ceil_div(total_flat, self.tile_m), 1, 1)
+        grid_dim = (num_m_blocks, 1, 1)
         self.kernel(
             mO_partial_tma,
             mLSE_partial_tma,
@@ -1856,6 +1874,7 @@ class SparseAttentionForwardCombine:
             self.tiled_copy_partial,
             self.tiled_copy_out,
             self.s2r_tiled_copy_lse,
+            self.g2s_tiled_copy_lse,
             FastDivmodDivisor(num_head),
             self.use_pdl,
         ).launch(
@@ -1883,7 +1902,7 @@ class SparseAttentionForwardCombine:
         mTileCounters: Optional[cute.Tensor],
         tiles_per_page_log2: Int32,
         tma_atom_O_partial: cute.CopyAtom,
-        tma_atom_LSE: cute.CopyAtom,
+        tma_atom_LSE: Optional[cute.CopyAtom],
         tma_atom_LSE_temperature: Optional[cute.CopyAtom],
         SharedStorage: cutlass.Constexpr,
         smem_layout_lse: cute.Layout,
@@ -1893,6 +1912,7 @@ class SparseAttentionForwardCombine:
         tiled_copy_partial: cute.TiledCopy,
         tiled_copy_out: cute.TiledCopy,
         s2r_tiled_copy_lse: cute.TiledCopy,
+        g2s_tiled_copy_lse: cute.TiledCopy,
         head_divmod: FastDivmodDivisor,
         use_pdl: cutlass.Constexpr[bool],
     ):
@@ -1926,7 +1946,7 @@ class SparseAttentionForwardCombine:
         if tidx == 0:
             for stage in cutlass.range(self.stages, unroll_full=True):
                 cute.arch.mbarrier_init(ring_mbar + stage, 1)
-            cute.arch.mbarrier_init(lse_mbar, 1)
+            cute.arch.mbarrier_init(lse_mbar, 1 if self.lse_split_aligned else self.num_threads)
             cute.arch.mbarrier_init_fence()
             if const_expr(steer_tiles):
                 sTile[0] = self.claim_tile(
@@ -1953,49 +1973,76 @@ class SparseAttentionForwardCombine:
         o_tma_bytes = const_expr(
             cute.size_in_bytes(self.dtype_partial, cute.select(smem_layout_o_tma, mode=[0, 1]))
         )
-        gLSE = cute.local_tile(mLSE_partial_tma, (self.tile_m, self.topk), (None, 0))
-        tLSEsLSE_tma, tLSEgLSE_tma = cpasync.tma_partition(
-            tma_atom_LSE,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sLSE_tma, 0, 2),
-            cute.group_modes(gLSE, 0, 2),
-        )
-        lse_tma_bytes = const_expr(
-            cute.size_in_bytes(Float32, cute.select(smem_layout_lse_tma, mode=[0, 1]))
-        )
-        if const_expr(has_temperature):
-            gLSE_temperature = cute.local_tile(
-                mLSE_temperature_partial_tma, (self.tile_m, self.topk), (None, 0)
-            )
-            tLSEsLSE_temperature_tma, tLSEgLSE_temperature_tma = cpasync.tma_partition(
-                tma_atom_LSE_temperature,
+        # The LSE tile: with aligned slabs one (tile_m, num_splits) TMA box per tile; otherwise
+        # 4-byte cp.async copies by every thread into the same smem bytes, completing the same
+        # barrier with one arrive per thread.
+        if const_expr(self.lse_split_aligned):
+            gLSE = cute.local_tile(mLSE_partial_tma, (self.tile_m, self.topk), (None, 0))
+            tLSEsLSE_tma, tLSEgLSE_tma = cpasync.tma_partition(
+                tma_atom_LSE,
                 0,
                 cute.make_layout(1),
-                cute.group_modes(sLSE_temperature_tma, 0, 2),
-                cute.group_modes(gLSE_temperature, 0, 2),
+                cute.group_modes(sLSE_tma, 0, 2),
+                cute.group_modes(gLSE, 0, 2),
             )
+            if const_expr(has_temperature):
+                gLSE_temperature = cute.local_tile(
+                    mLSE_temperature_partial_tma, (self.tile_m, self.topk), (None, 0)
+                )
+                tLSEsLSE_temperature_tma, tLSEgLSE_temperature_tma = cpasync.tma_partition(
+                    tma_atom_LSE_temperature,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sLSE_temperature_tma, 0, 2),
+                    cute.group_modes(gLSE_temperature, 0, 2),
+                )
+            lse_tma_bytes = const_expr(
+                cute.size_in_bytes(Float32, cute.select(smem_layout_lse_tma, mode=[0, 1]))
+            )
+        else:
+            g2s_thr_copy_lse = g2s_tiled_copy_lse.get_slice(tidx)
+            row_in_tile = g2s_thr_copy_lse.partition_S(
+                cute.make_identity_tensor((self.tile_m, self.topk))
+            )[0, 0, 0][0]
+            if tile_begin + row_in_tile < total_flat:
+                gLSE_tile = cute.local_tile(mLSE_partial_tma, (self.tile_m, self.topk), (m_block, 0))
+                cute.copy(
+                    g2s_tiled_copy_lse,
+                    g2s_thr_copy_lse.partition_S(gLSE_tile),
+                    g2s_thr_copy_lse.partition_D(sLSE_tma[None, None, 0]),
+                )
+                if const_expr(has_temperature):
+                    gLSE_temperature_tile = cute.local_tile(
+                        mLSE_temperature_partial_tma, (self.tile_m, self.topk), (m_block, 0)
+                    )
+                    cute.copy(
+                        g2s_tiled_copy_lse,
+                        g2s_thr_copy_lse.partition_S(gLSE_temperature_tile),
+                        g2s_thr_copy_lse.partition_D(sLSE_temperature_tma[None, None, 0]),
+                    )
+            cute.arch.cp_async_mbarrier_arrive_noinc(lse_mbar)
         primed_stages = const_expr(min(self.stages, self.topk))
         # One warp puts the LSE tile and the first ring slots in flight; they land while the
         # CTA decodes its rows.
         if warp_idx == 0:
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    lse_mbar, lse_tma_bytes * (2 if has_temperature else 1)
-                )
-            cute.copy(
-                tma_atom_LSE,
-                tLSEgLSE_tma[None, m_block],
-                tLSEsLSE_tma[None, 0],
-                tma_bar_ptr=lse_mbar,
-            )
-            if const_expr(has_temperature):
+            if const_expr(self.lse_split_aligned):
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        lse_mbar, lse_tma_bytes * (2 if has_temperature else 1)
+                    )
                 cute.copy(
-                    tma_atom_LSE_temperature,
-                    tLSEgLSE_temperature_tma[None, m_block],
-                    tLSEsLSE_temperature_tma[None, 0],
+                    tma_atom_LSE,
+                    tLSEgLSE_tma[None, m_block],
+                    tLSEsLSE_tma[None, 0],
                     tma_bar_ptr=lse_mbar,
                 )
+                if const_expr(has_temperature):
+                    cute.copy(
+                        tma_atom_LSE_temperature,
+                        tLSEgLSE_temperature_tma[None, m_block],
+                        tLSEsLSE_temperature_tma[None, 0],
+                        tma_bar_ptr=lse_mbar,
+                    )
             for stage in cutlass.range(primed_stages, unroll_full=True):
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(ring_mbar + stage, o_tma_bytes)
@@ -2350,8 +2397,6 @@ def combine(
         raise ValueError(f"the combine supports head dim 128, got {dim}")
     if not 1 <= num_splits <= 256:
         raise ValueError(f"num_splits must be in [1, 256], got {num_splits}")
-    if head_q % 4:
-        raise ValueError(f"head_q must be a multiple of 4, got {head_q}")
     split_stride = o_partial_fake.stride(0)
     if o_partial_fake.stride()[1:] != (head_q * dim, dim, 1) or split_stride < total_q * head_q * dim:
         raise ValueError(
@@ -2468,6 +2513,10 @@ def combine(
                 "the o_partial_fake split stride must be a multiple of num_domains x page_bytes "
                 "so the pages of every slab fall into the same domains"
             )
+    # A tensor map's split stride must be 16-byte aligned: with a head count that is a multiple
+    # of 4 every split's FP32 LSE slab is, whatever total_q, and one 2-D box loads a tile's LSEs;
+    # otherwise the kernel issues one 1-D box per split.
+    lse_split_aligned = head_q % 4 == 0
     capability = torch.cuda.get_device_capability(device)
 
     key = (
@@ -2486,6 +2535,7 @@ def combine(
         has_output_scale,
         use_pdl,
         num_domains,
+        lse_split_aligned,
     )
     if key not in _combine_compile_cache:
         loaded = try_load_aot(key)
@@ -2504,6 +2554,7 @@ def combine(
                 stages=STAGES,
                 use_pdl=use_pdl,
                 num_domains=num_domains,
+                lse_split_aligned=lse_split_aligned,
             )
             total_q_sym, nheads_sym = (cute.sym_int64() for _ in range(2))
             mO_partial = make_fake_tensor(

@@ -5,8 +5,9 @@
 reference, with NaN in every partial slot past a row's valid split count so a masking defect
 shows up as a non-finite output. Covers the split counts, head counts, partial and output
 dtypes, the temperature LSE and the output scale the forward kernels can hand it, padded split
-slabs, and the per-domain tile claiming of a locality-striped workspace (with a synthetic SM
-table, so it runs on any GPU)."""
+slabs, head counts whose LSE slabs are not 16-byte aligned (one 1-D bulk copy per split), and the
+per-domain tile claiming of a locality-striped workspace (with a synthetic SM table, so it runs on
+any GPU)."""
 
 from __future__ import annotations
 
@@ -32,6 +33,9 @@ class CombineCase:
     topk: int
     partial_dtype: torch.dtype = torch.bfloat16
     out_dtype: torch.dtype = torch.bfloat16
+    # Query heads per KV head; a total head count that is not a multiple of 4 leaves the flat
+    # row count unaligned for a 2-D LSE box.
+    q_heads_per_kv: int = Q_HEADS_PER_KV
     split_counts: bool = True
     lse_out: bool = True
     temperature: bool = False
@@ -59,6 +63,11 @@ CASES = (
     CombineCase("h64_topk16_two_domains", 333, 4, 16, slab_rows=2 * PAGE_ROWS, domains=2),
     CombineCase("h16_topk8_two_domains_partial_tile", 171, 1, 8, slab_rows=2 * PAGE_ROWS,
                 domains=2),
+    # Flat row counts 333, 342 and 606: no split slab starts 16-byte aligned
+    CombineCase("h1_topk16_odd_rows", 333, 1, 16, q_heads_per_kv=1),
+    CombineCase("h2_topk8_f16_partials", 171, 1, 8, partial_dtype=torch.float16, q_heads_per_kv=2),
+    CombineCase("h6_topk32_temperature_scale", 101, 2, 32, temperature=True, output_scale=True,
+                q_heads_per_kv=3),
 )
 
 
@@ -94,7 +103,7 @@ def _nan_fill(tensor: torch.Tensor, mask: torch.Tensor) -> None:
 def test_combine_merges_the_valid_splits(case: CombineCase, device: torch.device):
     _, combine = _sparse_stack()
     gen = torch.Generator(device=device).manual_seed(hash(case.name) & 0xFFFF)
-    heads = case.num_kv_heads * Q_HEADS_PER_KV
+    heads = case.num_kv_heads * case.q_heads_per_kv
     shape = (case.topk, case.total_q, heads)
 
     partial_real = torch.randn(*shape, HEAD_DIM, generator=gen, device=device).to(case.partial_dtype)
@@ -109,7 +118,7 @@ def test_combine_merges_the_valid_splits(case: CombineCase, device: torch.device
                                      device=device, dtype=torch.int32)
         split_counts[0::7] = case.topk
         split_counts[3::11] = 1
-        counts_q = split_counts.repeat_interleave(Q_HEADS_PER_KV, dim=1)
+        counts_q = split_counts.repeat_interleave(case.q_heads_per_kv, dim=1)
     else:
         split_counts = None
         counts_q = torch.full((case.total_q, heads), case.topk, device=device, dtype=torch.int32)
