@@ -130,7 +130,7 @@ def test_combine_merges_the_valid_splits(case: CombineCase, device: torch.device
     _nan_fill(o_partial, ~valid)
     locality = None
     if case.domains:
-        from src.blackwell_prefill.combine import LocalityHints
+        from src.sm100.fwd.combine import LocalityHints
 
         locality = LocalityHints(
             sm_domains=torch.arange(4096, dtype=torch.int32, device=device) % case.domains,

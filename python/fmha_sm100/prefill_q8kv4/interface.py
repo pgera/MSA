@@ -33,14 +33,14 @@ _KV_SCALE_ROW_BYTES = _HEAD_DIM // 16
 def _sparse_stack():
     """Return fmha_sm100's k2q CSR builder and split combine (the CuTe-DSL sparse stack)."""
     from .. import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
-    from src.blackwell_prefill.combine import combine
+    from src.sm100.fwd.combine import combine
 
     return sparse.build_k2q_csr, combine
 
 
 def _locality_hints_type():
     from .. import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
-    from src.blackwell_prefill.combine import LocalityHints
+    from src.sm100.fwd.combine import LocalityHints
 
     return LocalityHints
 

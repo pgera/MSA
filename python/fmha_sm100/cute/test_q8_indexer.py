@@ -836,7 +836,7 @@ def _make_prefill(
     }
 
 
-def _plan_prefill(wrapper, inputs):
+def _plan_prefill(wrapper, inputs, **kwargs):
     wrapper.plan(
         inputs["cu_seqlens_q"],
         inputs["seq_lens"],
@@ -844,6 +844,7 @@ def _plan_prefill(wrapper, inputs):
         total_q=inputs["total_q"],
         max_seqlen_q=inputs["max_seqlen_q"],
         max_seqlen_k=inputs["max_seqlen_k"],
+        **kwargs,
     )
 
 
@@ -962,6 +963,48 @@ def test_prefill_plan_reuse_replan_and_cuda_graph(num_heads):
     torch.cuda.synchronize()
     assert torch.equal(out, expected)
     assert torch.equal(wrapper._state.scores.nan_to_num(POISON), expected_scores)
+
+
+@pytest.mark.parametrize("num_heads", PREFILL_HEADS)
+def test_prefill_score_out_writes_caller_buffer(num_heads):
+    """``score_out`` takes the scores at the caller's pitch; ``run_scores`` skips the TopK."""
+
+    inputs = _make_prefill([300, 45, 900], [100, 2000, 0], seed=11, num_heads=num_heads)
+    q, k_cache = inputs["q"], inputs["k"].cache
+    owned = BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
+    _plan_prefill(owned, inputs)
+    expected = _run_prefill_scores(owned, q, k_cache).clone()
+    expected_topk = owned.run(q, k_cache).clone()
+
+    # A row-offset slice of a wider buffer, the way vLLM passes its shared scores.
+    rows, width = expected.shape
+    shared = torch.full((rows + 3, 8192), float("nan"), device="cuda")
+    score_out = shared[3:]
+    wrapper = BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
+    _plan_prefill(wrapper, inputs, score_out=score_out)
+    wrapper._state.topk_indices.fill_(-777)
+    assert wrapper.run_scores(q, k_cache).data_ptr() == score_out.data_ptr()
+    torch.cuda.synchronize()
+    assert (wrapper._state.topk_indices == -777).all()
+    assert torch.equal(score_out[:, :width].nan_to_num(POISON), expected.nan_to_num(POISON))
+    assert torch.isnan(score_out[:, width:]).all()
+    assert torch.isnan(shared[:3]).all()
+    assert torch.equal(wrapper.run(q, k_cache), expected_topk)
+
+
+def test_prefill_rejects_invalid_score_out():
+    inputs = _make_prefill([10, 20], [0, 100], seed=9)
+    rows = inputs["total_q"]
+    max_pages = -(-inputs["max_seqlen_k"] // PAGE_SIZE)
+    for bad in (
+        torch.empty((rows, max_pages), dtype=torch.bfloat16, device="cuda"),
+        torch.empty((rows + 1, max_pages), device="cuda"),
+        torch.empty((rows, max_pages - 1), device="cuda"),
+        torch.empty((max_pages + 1, rows), device="cuda").t(),
+        torch.empty((rows, max_pages)),
+    ):
+        with pytest.raises((TypeError, ValueError), match="score_out"):
+            _plan_prefill(BatchPrefillIndexerQ8KV8Wrapper(), inputs, score_out=bad)
 
 
 def test_prefill_compile_is_shape_independent():

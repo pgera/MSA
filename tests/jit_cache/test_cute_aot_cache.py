@@ -21,10 +21,10 @@ aot_cache = importlib.import_module("src.common.aot_cache")
 
 def test_the_closure_follows_the_kernel_module_imports():
     closure = {str(path.relative_to(CUTE))
-               for path in aot_cache._import_closure([CUTE / "src/blackwell_prefill/combine.py"])}
-    assert {"src/blackwell_prefill/combine.py", "src/common/utils.py",
-            "src/common/cute_dsl_utils.py", "src/__init__.py", "src/common/__init__.py"} <= closure
-    assert "src/blackwell_prefill/atten_fwd_sm100.py" not in closure, "another kernel"
+               for path in aot_cache._import_closure([CUTE / "src/sm100/fwd/combine.py"])}
+    assert {"src/sm100/fwd/combine.py", "src/common/utils.py", "src/common/seqlen_info.py",
+            "src/__init__.py", "src/common/__init__.py"} <= closure
+    assert "src/sm100/fwd/atten_fwd.py" not in closure, "another kernel"
     assert "src/common/aot_cache.py" not in closure, "the cache does not generate code"
 
 

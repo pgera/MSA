@@ -442,6 +442,15 @@ prefill.plan(
 topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 4, 16] int32
 ```
 
+A caller that runs its own page selection (for example vLLM's shared TopK over
+decode and prefill rows) passes its score buffer to `plan` and scores without
+the TopK:
+
+```python
+prefill.plan(..., score_out=scores[rows_lo:rows_hi])  # fp32 [total_q * num_heads, >= max_pages]
+prefill.run_scores(index_q, index_k_cache)            # writes pages before each row's local page
+```
+
 ### Q8KV Input And Output Contract
 
 - `index_q`: `[num_tokens, num_heads, 128]`, `torch.float8_e4m3fn`,
@@ -775,4 +784,4 @@ High-signal files:
 - Paged FP8 decode `batch <= 1024`. The single-CTA schedule kernel stores per-batch state in shared memory; larger batches need a multi-CTA cooperative redesign (planned but not yet implemented).
 - Paged FP8 decode requires `seqused_k[b] >= seqlen_q` for every batch (i.e. context must include the q-tokens being emitted — a batched-decode invariant), AND `seqused_k[b] % page_size ∈ {0, seqlen_q, 2·seqlen_q, ..., page_size − seqlen_q}` (the last partial page must hold a whole packed-GQA q-group, which is `seqlen_q` columns). Violations are caught at `plan()` with a clear `ValueError`. The same constraint exists in FA-style packgqa kernels in principle but never fires there because FA's typical use satisfies `seqlen_k ≥ seqlen_q` (decode emits 1 token; prefill is self-attention). Tracked as a kernel-level TODO (saturate `causal_col_limit ≥ 1` in mask.py).
 - The combine kernel caps `max_splits ≤ 256` (its per-CTA LSE tile is `max_splits x 64` FP32 in shared memory). The schedule kernel auto-caps `chunk_pages ≥ ceil(max_pages / 256)` so this is never hit in auto mode, but at very large kv (> 512K) the cap reduces parallelism slightly. Tracked as a follow-up: rewrite combine with multi-pass tree reduction to remove the cap.
-- The combine reads BF16 or FP16 partials of head dim 128 in the varlen (`total_q`) layout; `partial_dtype` accepts `torch.bfloat16` and `torch.float16`.
+- The default combine reads BF16 or FP16 partials of head dim 128 in the varlen (`total_q`) layout for a query head count that is a multiple of 4; `partial_dtype=torch.float32` or `torch.float8_e4m3fn`, or another head count, runs the original combine kernel instead.

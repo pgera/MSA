@@ -249,6 +249,24 @@ def bind_indexer_module_loader(loader) -> None:
     _indexer_module_loader = loader
 
 
+def _check_score_out(
+    score_out: torch.Tensor, rows: int, max_pages: int, device: torch.device
+) -> None:
+    """Validate a caller-owned prefill score buffer: fp32 ``[rows, >= max_pages]``."""
+
+    _check_cuda_tensor(
+        score_out, name="score_out", dtype=torch.float32, device=device, contiguous=False
+    )
+    if score_out.ndim != 2 or score_out.shape[0] != rows or score_out.shape[1] < max_pages:
+        raise ValueError(
+            f"score_out must have shape [{rows}, >= {max_pages}], got {tuple(score_out.shape)}"
+        )
+    if score_out.stride(1) != 1 or score_out.stride(0) < score_out.shape[1]:
+        raise ValueError("score_out must keep each row's pages contiguous and rows disjoint")
+    if score_out.data_ptr() % _SCALAR_ALIGNMENT:
+        raise ValueError(f"score_out must be {_SCALAR_ALIGNMENT}-byte aligned")
+
+
 def _topk_select(
     scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, *, use_pdl: bool = True
 ) -> torch.Tensor:
@@ -602,6 +620,7 @@ class _PrefillPlanState:
     plan_error: torch.Tensor
     task_capacity: int
     num_candidate_q_tiles: int
+    max_page_chunk: int
     total_q: int
     num_heads: int
     scores: torch.Tensor
@@ -641,12 +660,19 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
             Int32(state.num_candidate_q_tiles),
             Int32(state.task_capacity),
             Int32(state.num_heads),
+            Int32(state.max_page_chunk),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         ),
     )
     reset_compiled(state.task_counts, state.plan_error)
-    build_compiled(*build_args, state.num_candidate_q_tiles, state.task_capacity, state.num_heads)
+    build_compiled(
+        *build_args,
+        state.num_candidate_q_tiles,
+        state.task_capacity,
+        state.num_heads,
+        state.max_page_chunk,
+    )
 
 
 class BatchPrefillIndexerQ8KV8Wrapper:
@@ -664,6 +690,9 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             total_q=total_q, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
         )
         topk_indices = wrapper.run(q, k_cache)
+
+    A caller that selects pages itself passes its own score buffer to ``plan``
+    (``score_out``) and calls ``run_scores``, which skips the TopK.
     """
 
     def __init__(self, *, num_heads: int = 1) -> None:
@@ -679,12 +708,19 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         total_q: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        score_out: torch.Tensor | None = None,
     ) -> None:
         """Size reusable buffers from host bounds and build device tasks.
 
         ``cu_seqlens_q`` is ``[batch + 1]`` int32 starting at zero. The host
         bounds must cover the device metadata; they size buffers and the plan
         grid but never enter a compile key. Call outside CUDA Graph capture.
+
+        ``score_out`` optionally replaces the wrapper's score buffer: fp32
+        ``[total_q * num_heads, >= ceil(max_seqlen_k / 128)]`` with contiguous
+        pages per row; the row pitch may be wider, so a slice of a larger
+        buffer works. Scores are written in place; entries the kernel does not
+        write keep their contents.
         """
 
         _check_cuda_tensor(cu_seqlens_q, name="cu_seqlens_q", dtype=torch.int32)
@@ -712,6 +748,24 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         total_rows = total_q * self._num_heads
         q_tile_capacity = -(-total_rows // q_tile) + batch - 1
         task_capacity = q_tile_capacity * -(-max_pages // _PREFILL_TASK_CAPACITY_PAGE_CHUNK)
+        # On SM107, cap the planner's page chunk so every Q tile splits into at
+        # most clusters // q_tiles tasks: short-query batches then fill the
+        # machine in one wave instead of leaving most clusters idle. Host-known
+        # upper bounds only (no D2H); long-query batches keep the default chunk.
+        if _require_supported_device(device) == (10, 7):
+            num_clusters = _sm_count(device) // Q8KV8PrefillIndexerSm100.cta_group_size
+            chunks_per_q_tile = max(1, num_clusters // q_tile_capacity)
+            max_page_chunk = max(
+                Q8KV8PrefillIndexerPlanBuild.min_page_chunk,
+                min(
+                    Q8KV8PrefillIndexerPlanBuild.large_page_chunk,
+                    -(-max_pages // chunks_per_q_tile),
+                ),
+            )
+        else:
+            max_page_chunk = Q8KV8PrefillIndexerPlanBuild.large_page_chunk
+        if score_out is not None:
+            _check_score_out(score_out, total_rows, max_pages, device)
         options = {"device": device}
         self._state = _PrefillPlanState(
             cu_seqlens_q=cu_seqlens_q,
@@ -732,9 +786,14 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             plan_error=torch.empty((1,), dtype=torch.int32, **options),
             task_capacity=task_capacity,
             num_candidate_q_tiles=batch * -(-max_seqlen_q * self._num_heads // q_tile),
+            max_page_chunk=max_page_chunk,
             total_q=total_q,
             num_heads=self._num_heads,
-            scores=torch.empty((total_rows, max_pages), dtype=torch.float32, **options),
+            scores=(
+                score_out
+                if score_out is not None
+                else torch.empty((total_rows, max_pages), dtype=torch.float32, **options)
+            ),
             num_valid_pages=torch.empty((total_rows,), dtype=torch.int32, **options),
             topk_indices=torch.empty(
                 (total_q, self._num_heads, _TOP_K), dtype=torch.int32, **options
@@ -748,6 +807,17 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         if self._state is None:
             raise RuntimeError("plan() must be called before replan()")
         _run_prefill_plan(self._state)
+
+    def run_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> torch.Tensor:
+        """Score every row's historical pages without the TopK; return the score buffer.
+
+        Each row's pages before its local page are written. The local page and
+        later pages keep their previous contents, so a caller selecting its own
+        pages pre-fills the buffer (for example with ``-inf``) and forces the
+        local page.
+        """
+
+        return self._run_scores(q, k_cache)
 
     def _run_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> torch.Tensor:
         """Write historical page scores; the local page and later pages stay untouched."""

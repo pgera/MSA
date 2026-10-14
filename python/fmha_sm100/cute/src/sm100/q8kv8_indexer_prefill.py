@@ -42,6 +42,26 @@ class Q8KV8PrefillIndexerSm100:
     # batch index, and (q_rows - 1) | (page_count - 1) << task_page_count_shift.
     task_descriptor_words = 5
     task_page_count_shift = 8
+    # Operand formats with a dedicated SM107 MMA instruction (K=64 per
+    # instruction). Any other format, and every other architecture, goes
+    # through the generic F8F6F4 instruction at K=32.
+    sm107_fp8_dtypes = (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+
+    @classmethod
+    def uses_sm107_fp8_mma(
+        cls,
+        compute_capability: tuple[int, int],
+        io_dtype=cutlass.Float8E4M3FN,
+    ) -> bool:
+        return compute_capability == (10, 7) and io_dtype in cls.sm107_fp8_dtypes
+
+    @classmethod
+    def mma_inst_k(
+        cls,
+        compute_capability: tuple[int, int],
+        io_dtype=cutlass.Float8E4M3FN,
+    ) -> int:
+        return 64 if cls.uses_sm107_fp8_mma(compute_capability, io_dtype) else 32
 
     def __init__(
         self,
@@ -59,11 +79,22 @@ class Q8KV8PrefillIndexerSm100:
         self.io_dtype = cutlass.Float8E4M3FN
         self.acc_dtype = cutlass.Float32
         self.compute_capability = compute_capability
+        # Two Q stages on SM107 so the next task's Q tile can land while the
+        # current task's pages are still being consumed; the MMA warp reads
+        # its Q operand from the current consumer stage.
+        self.q_stages = 2 if compute_capability == (10, 7) else 1
         self.num_persistent_clusters = num_persistent_clusters
-        self.use_tmem_load_reduce = compute_capability == (10, 3)
+        self.use_tmem_load_reduce = compute_capability in ((10, 3), (10, 7))
         self.cluster_shape_mnk = (2, 1, 1)
         self.mma_tiler_mnk = (self.q_tile, self.k_tile, self.head_dim)
-        self.mma_inst_shape_mnk = (self.q_tile, self.k_tile, 32)
+        self.use_sm107_fp8_mma = self.uses_sm107_fp8_mma(
+            compute_capability, self.io_dtype
+        )
+        self.mma_inst_shape_mnk = (
+            self.q_tile,
+            self.k_tile,
+            self.mma_inst_k(compute_capability, self.io_dtype),
+        )
 
         self.score_warp_ids = tuple(range(8))
         self.q_load_warp_id = 8
@@ -73,8 +104,18 @@ class Q8KV8PrefillIndexerSm100:
         self.score_consumer_warps = 4
         self.score_worker_groups = 2
         self.threads_per_cta = cute.arch.WARP_SIZE * 12
-        self.num_regs_score = 192
-        self.num_regs_other = 32
+        # Register budgets per warp role. The launch allocates 168 registers
+        # per thread (64K / 384 threads). On SM107 every role keeps that: the
+        # score warps fit in 168, and growing them to 192 starved the loader
+        # and MMA warps. SM100 and SM103 keep the original split. If a split is
+        # used, 8 * 32 * (score - 168) <= 4 * 32 * (168 - other) must hold or
+        # the score warps spin forever in setmaxregister_increase.
+        if compute_capability == (10, 7):
+            self.num_regs_score = 168
+            self.num_regs_other = 168
+        else:
+            self.num_regs_score = 192
+            self.num_regs_other = 32
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
     @cute.jit
@@ -90,16 +131,28 @@ class Q8KV8PrefillIndexerSm100:
         stream: cuda.CUstream = None,
     ):
         """Build descriptors and launch the 2-CTA kernel."""
-        op = tcgen05.MmaF8F6F4Op(
-            self.io_dtype,
-            self.io_dtype,
-            self.acc_dtype,
-            self.mma_inst_shape_mnk,
-            tcgen05.CtaGroup.TWO,
-            tcgen05.OperandSource.SMEM,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-        )
+        if cutlass.const_expr(self.use_sm107_fp8_mma):
+            op = tcgen05.SM107MmaFP8Op(
+                self.io_dtype,
+                self.io_dtype,
+                self.acc_dtype,
+                self.mma_inst_shape_mnk,
+                tcgen05.CtaGroup.TWO,
+                tcgen05.OperandSource.SMEM,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+            )
+        else:
+            op = tcgen05.MmaF8F6F4Op(
+                self.io_dtype,
+                self.io_dtype,
+                self.acc_dtype,
+                self.mma_inst_shape_mnk,
+                tcgen05.CtaGroup.TWO,
+                tcgen05.OperandSource.SMEM,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+            )
         tiled_mma = cute.make_tiled_mma(op)
         q_smem_layout = sm100_utils.make_smem_layout_a(
             tiled_mma,
@@ -422,7 +475,7 @@ class Q8KV8PrefillIndexerSm100:
                 acc_consumer_state.advance()
             tile_base = cutlass.Int32(0)
             worker_base = cutlass.Int32(0)
-            for rev_bucket in cutlass.range_constexpr(self.num_task_buckets):
+            for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                 bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
                 task_count = mTaskCounts[bucket]
                 task_idx = cluster_idx - worker_base
@@ -503,7 +556,7 @@ class Q8KV8PrefillIndexerSm100:
                 self.q_stages,
             )
             worker_base = cutlass.Int32(0)
-            for rev_bucket in cutlass.range_constexpr(self.num_task_buckets):
+            for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                 bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
                 task_count = mTaskCounts[bucket]
                 task_idx = cluster_idx - worker_base
@@ -565,7 +618,7 @@ class Q8KV8PrefillIndexerSm100:
                 self.k_stages,
             )
             worker_base = cutlass.Int32(0)
-            for rev_bucket in cutlass.range_constexpr(self.num_task_buckets):
+            for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                 bucket = cutlass.Int32(self.num_task_buckets - 1 - rev_bucket)
                 task_count = mTaskCounts[bucket]
                 task_idx = cluster_idx - worker_base
@@ -584,20 +637,47 @@ class Q8KV8PrefillIndexerSm100:
                         task_idx,
                         mTaskDescriptors,
                     )
-                    for tile_idx in cutlass.range(page_count, unroll=1):
-                        logical_page = page_begin + tile_idx
-                        physical_page = mPageTable[batch_idx, logical_page]
-                        k_pipe.producer_acquire(k_producer_state)
-                        cute.copy(
-                            k_tma_atom,
-                            tKgK[(None, 0, physical_page)],
-                            tKsK[(None, k_producer_state.index)],
-                            tma_bar_ptr=k_pipe.producer_get_barrier(
-                                k_producer_state
-                            ),
-                            mcast_mask=k_mcast_mask,
-                        )
-                        k_producer_state.advance()
+                    if cutlass.const_expr(self.compute_capability == (10, 7)):
+                        # The physical page index is a dependent global load on
+                        # the TMA issue path; fetch the next page's index while
+                        # this page's TMA is issued so the two latencies overlap.
+                        # The last iteration re-reads the final entry (in bounds).
+                        last_page = page_begin + page_count - cutlass.Int32(1)
+                        physical_page = mPageTable[batch_idx, page_begin]
+                        for tile_idx in cutlass.range(page_count, unroll=1):
+                            logical_page = page_begin + tile_idx
+                            next_page = cutlass.min(
+                                logical_page + cutlass.Int32(1), last_page
+                            )
+                            next_physical_page = mPageTable[batch_idx, next_page]
+                            k_pipe.producer_acquire(k_producer_state)
+                            cute.copy(
+                                k_tma_atom,
+                                tKgK[(None, 0, physical_page)],
+                                tKsK[(None, k_producer_state.index)],
+                                tma_bar_ptr=k_pipe.producer_get_barrier(
+                                    k_producer_state
+                                ),
+                                mcast_mask=k_mcast_mask,
+                            )
+                            k_producer_state.advance()
+                            physical_page = next_physical_page
+                    else:
+                        physical_page = cutlass.Int32(0)
+                        for tile_idx in cutlass.range(page_count, unroll=1):
+                            logical_page = page_begin + tile_idx
+                            physical_page = mPageTable[batch_idx, logical_page]
+                            k_pipe.producer_acquire(k_producer_state)
+                            cute.copy(
+                                k_tma_atom,
+                                tKgK[(None, 0, physical_page)],
+                                tKsK[(None, k_producer_state.index)],
+                                tma_bar_ptr=k_pipe.producer_get_barrier(
+                                    k_producer_state
+                                ),
+                                mcast_mask=k_mcast_mask,
+                            )
+                            k_producer_state.advance()
                     task_idx += cutlass.Int32(self.num_persistent_clusters)
                 worker_base = (
                     worker_base + task_count
@@ -620,9 +700,7 @@ class Q8KV8PrefillIndexerSm100:
             num_k_blocks = cute.size(tCrQ, mode=[2])
             if is_leader_cta:
                 worker_base = cutlass.Int32(0)
-                for rev_bucket in cutlass.range_constexpr(
-                    self.num_task_buckets
-                ):
+                for rev_bucket in cutlass.range(self.num_task_buckets, unroll=1):
                     bucket = cutlass.Int32(
                         self.num_task_buckets - 1 - rev_bucket
                     )
@@ -665,7 +743,12 @@ class Q8KV8PrefillIndexerSm100:
                                     tiled_mma,
                                     tCtAcc,
                                     tCrQ[
-                                        (None, None, k_block_idx, 0)
+                                        (
+                                            None,
+                                            None,
+                                            k_block_idx,
+                                            q_consumer_state.index,
+                                        )
                                     ],
                                     tCrK[
                                         (

@@ -20,6 +20,7 @@ Preprocessing (external, done once):
         -> k2q_q_indices [head_kv, total_q * topK]  int32
 """
 
+import functools
 import math
 import os
 from typing import Optional
@@ -30,7 +31,7 @@ import torch
 from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 
-from src.blackwell_prefill.combine import combine
+from src.sm100.fwd.combine import combine, combine_f32f8
 from src.sm100.fwd.atten_fwd import SparseAttentionForwardSm100
 from src.sm100.fwd.atten_fwd_nvfp4_kv import SparseAttentionForwardNvfp4KvSm100
 from src.sm100.prepare_scheduler import (
@@ -58,11 +59,23 @@ def _to_cute_int32_metadata(t: torch.Tensor):
     return to_cute_tensor_kvouter(t, assumed_align=4)
 
 
+def _select_combine(partial_dtype: torch.dtype, head_q: int, cu_seqlens: torch.Tensor):
+    """The default combine streams BF16/FP16 partials through TMA over the flat (query, head)
+    rows, which keeps every split's FP32 LSE slab 16-byte aligned only for a head count that
+    is a multiple of 4. FP32 / FP8 E4M3 partials and other head counts run on combine_f32f8,
+    which walks the varlen rows by cu_seqlens."""
+    if partial_dtype in (torch.bfloat16, torch.float16) and head_q % 4 == 0:
+        return combine
+    return functools.partial(combine_f32f8, cu_seqlens=cu_seqlens)
+
+
 def _normalize_partial_dtype(partial_dtype: torch.dtype) -> torch.dtype:
-    supported = {torch.bfloat16, torch.float16}
+    supported = {torch.float32, torch.bfloat16, torch.float16, torch.float8_e4m3fn}
     if partial_dtype not in supported:
         raise TypeError(
-            f"partial_dtype must be torch.bfloat16 or torch.float16, got {partial_dtype}"
+            "partial_dtype must be one of torch.float32 / torch.bfloat16 / "
+            "torch.float16 / torch.float8_e4m3fn, "
+            f"got {partial_dtype}"
         )
     return partial_dtype
 
@@ -640,7 +653,6 @@ def _try_blackwell_sparse_prefill(
     if (not causal or schedule is None or page_table is None
             or partial_dtype != torch.bfloat16
             or return_softmax_lse or return_temperature_lse
-            or output_scale is not None
             or enable_fp16_softmax or enable_2x_fp8
             or qk_dtype != q.dtype or pv_dtype != q.dtype):
         return None
@@ -682,7 +694,10 @@ def _try_blackwell_sparse_prefill(
         k2q_row_ptr, k2q_q_indices, schedule, partial, stats,
         softmax_scale=softmax_scale, max_seqlen_q=max_seqlen_q, seqused_k=seqused_k,
     )
-    combine(partial, stats, out, None, split_counts=schedule.split_counts, use_pdl=True)
+    _select_combine(partial.dtype, q.shape[1], cu_seqlens_q)(
+        partial, stats, out, None,
+        split_counts=schedule.split_counts, use_pdl=True, output_scale=output_scale,
+    )
     return out
 
 
@@ -762,8 +777,8 @@ def sparse_atten_func(
         ``softmax_scale / lse_temperature_scale``.  Requires
         ``return_softmax_lse=True``.
     partial_dtype : torch.dtype, optional
-        Storage dtype of the per-block partial O (BF16 or FP16); the combine
-        accumulates them in FP32.
+        Storage dtype of the per-block partial O: FP32, BF16, FP16 or FP8
+        E4M3; the combine accumulates them in FP32.
     return_softmax_lse : bool, optional
         If True, return ``(out, softmax_lse)`` or
         ``(out, softmax_lse, temperature_lse)``.
@@ -981,8 +996,8 @@ def sparse_atten_nvfp4_kv_func(
         If True, also return temperature-scaled LSE.  Requires
         ``return_softmax_lse=True``.
     partial_dtype : torch.dtype, optional
-        Storage dtype of the per-block partial O (BF16 or FP16); the combine
-        accumulates them in FP32.
+        Storage dtype of the per-block partial O: FP32, BF16, FP16 or FP8
+        E4M3; the combine accumulates them in FP32.
     return_softmax_lse : bool, optional
         If True, return LSE together with the output.
     page_table : torch.Tensor, optional
@@ -1126,7 +1141,7 @@ def sparse_atten_nvfp4_kv_func(
         kv_layout=kv_layout,
     )
 
-    combine(
+    _select_combine(O_partial.dtype, O_partial.shape[2], cu_seqlens_q)(
         O_partial,
         LSE_partial,
         O_out,
@@ -1696,7 +1711,7 @@ def _sparse_atten_csr_varlen_forward(
     )
     # Sparse Attention and Sparse Page Attention both use the varlen-Q
     # combine path; the kernel-written LSE_out is the final contract.
-    combine(
+    _select_combine(O_partial.dtype, O_partial.shape[2], cu_seqlens_q)(
         O_partial,
         LSE_partial,
         O_out,
