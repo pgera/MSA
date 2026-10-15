@@ -1538,6 +1538,13 @@ def combine_f32f8(
 TILE_M = 64
 NUM_THREADS = 256
 STAGES = 4
+# Use a two-slot ring when the reads are not steered on SM107. Unsteered partials are
+# interleaved across the memory locality domains, so half of each CTA's reads cross the
+# inter-domain fabric, and on SM107 that fabric caps interleaved reads well below the local HBM
+# rate. Keep in flight only what the fabric drains in one round trip: a deeper ring adds
+# queueing that also delays the local half of the reads. Steered reads are domain-local and
+# B200/B300 interleaved reads are HBM-bound, so both keep the four-slot ring.
+STAGES_INTERLEAVED = 2
 # The partial buffer is addressed as (dim, flat row, split); the TMA descriptor lowering is
 # relied on for split strides below this many elements.
 MAX_SPLIT_SLAB_ELEMENTS = 2**31
@@ -2515,9 +2522,11 @@ def combine(
             )
     # A tensor map's split stride must be 16-byte aligned: with a head count that is a multiple
     # of 4 every split's FP32 LSE slab is, whatever total_q, and one 2-D box loads a tile's LSEs;
-    # otherwise the kernel issues one 1-D box per split.
+    # otherwise the kernel brings the tile in with 4-byte cp.async copies.
     lse_split_aligned = head_q % 4 == 0
     capability = torch.cuda.get_device_capability(device)
+    # Unsteered reads on SM107 are fabric-bound; see STAGES_INTERLEAVED.
+    stages = STAGES_INTERLEAVED if capability == (10, 7) and not num_domains else STAGES
 
     key = (
         "combine",
@@ -2525,7 +2534,7 @@ def combine(
         dim,
         TILE_M,
         NUM_THREADS,
-        STAGES,
+        stages,
         num_splits,
         partial_dtype,
         out_dtype,
@@ -2551,7 +2560,7 @@ def combine(
                 topk=num_splits,
                 tile_m=TILE_M,
                 num_threads=NUM_THREADS,
-                stages=STAGES,
+                stages=stages,
                 use_pdl=use_pdl,
                 num_domains=num_domains,
                 lse_split_aligned=lse_split_aligned,
